@@ -107,12 +107,12 @@ valid_user() {
 
 valid_pass() {
     case "$1" in *[!a-zA-Z0-9_-]*) return 1 ;; esac
-    [ "${#1}" -ge 16 ] && [ "${#1}" -le 128 ]
+    [ "${#1}" -ge 10 ] && [ "${#1}" -le 128 ]
 }
 
 validate() {
     if ! valid_port "$PORT" || ! valid_user "$USER_NAME" || ! valid_pass "$PASS"; then
-        error '端口须为 1024–65535（无前导零）；用户名 1–64 位（字母、数字、_ . -）；密码 16–128 位（字母、数字、_ -）。'
+        error '端口须为 1024–65535（无前导零）；用户名 1–64 位（字母、数字、_ . -）；密码 10–128 位（字母、数字、_ -）。'
         return 1
     fi
 }
@@ -154,6 +154,120 @@ randhex() {
     od -An -N "$1" -tx1 /dev/urandom | tr -d ' \n'
 }
 
+# Reject bytes >=248 so each of the 62 characters has equal probability.
+random_credential() {
+    credential=$(od -An -N64 -tu1 /dev/urandom | awk '
+        BEGIN { chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789" }
+        { for (i = 1; i <= NF; i++) if ($i < 248) {
+            printf "%s", substr(chars, ($i % 62) + 1, 1)
+            if (++count == 10) exit
+        } }
+    ') || return 1
+    [ "${#credential}" -eq 10 ] || { error '随机凭据生成失败。'; return 1; }
+    printf '%s\n' "$credential"
+}
+
+# Keep the original account's paths; extra accounts have stable instance IDs.
+init_account_paths() {
+    BASE_SERVICE=$SERVICE BASE_CONF=$CONF BASE_INIT=$INIT BASE_LOG=$LOG
+}
+
+account_context() {
+    SERVICE=$BASE_SERVICE CONF=$BASE_CONF INIT=$BASE_INIT LOG=$BASE_LOG
+    if [ "$1" != default ]; then
+        case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac
+        [ "${#1}" -eq 10 ] || return 1
+        SERVICE="$BASE_SERVICE.user-$1" CONF="$BASE_CONF.user-$1"
+        INIT="$BASE_INIT.user-$1" LOG="${BASE_LOG%.log}.user-$1.log"
+    fi
+}
+
+account_ids() {
+    [ ! -f "$BASE_CONF" ] || printf 'default\n'
+    for account_file in "$BASE_CONF".user-*; do
+        [ -f "$account_file" ] || continue
+        account_id=${account_file#"$BASE_CONF.user-"}
+        case "$account_id" in ''|*[!0-9a-f]*) continue ;; esac
+        [ "${#account_id}" -ne 10 ] || printf '%s\n' "$account_id"
+    done
+}
+
+account_record() (
+    account_context "$1" && load_conf || exit 1
+    printf '%s %s\n' "$USER_NAME" "$PORT"
+)
+
+validate_unique() {
+    for unique_id in $(account_ids); do
+        unique_conf=$BASE_CONF
+        [ "$unique_id" = default ] || unique_conf="$BASE_CONF.user-$unique_id"
+        [ "$unique_conf" != "$CONF" ] || continue
+        unique_record=$(account_record "$unique_id") || return 1
+        if [ "${unique_record% *}" = "$USER_NAME" ]; then
+            error '用户名已存在，请使用其他用户名。'; return 1
+        fi
+        if [ "${unique_record##* }" = "$PORT" ]; then
+            error '端口已分配给其他账号（包括已停止的服务）。'; return 1
+        fi
+    done
+}
+
+port_reserved() {
+    for reserved_id in $(account_ids); do
+        reserved_record=$(account_record "$reserved_id") || return 2
+        [ "${reserved_record##* }" != "$1" ] || return 0
+    done
+    return 1
+}
+
+list_users() {
+    list_ids=$(account_ids)
+    [ -n "$list_ids" ] || { error '没有账号，请先安装。'; return 1; }
+    printf '\n用户名\tTCP 端口\t服务名\n'
+    for list_id in $list_ids; do
+        list_record=$(account_record "$list_id") || return 1
+        list_service=$BASE_SERVICE
+        [ "$list_id" = default ] || list_service="$BASE_SERVICE.user-$list_id"
+        printf '%s\t%s\t%s\n' "${list_record% *}" "${list_record##* }" "$list_service"
+    done
+}
+
+select_account() {
+    list_users || return 1
+    if [ -n "${1:-}" ]; then
+        selected_name=$1
+    else
+        read_value '输入要操作的用户名（回车取消）: ' || return 1
+        selected_name=$REPLY
+        [ -n "$selected_name" ] || return 2
+    fi
+    for selected_id in $(account_ids); do
+        selected_record=$(account_record "$selected_id") || return 1
+        if [ "${selected_record% *}" = "$selected_name" ]; then
+            account_context "$selected_id"
+            return $?
+        fi
+    done
+    error '找不到该用户名。'
+    return 1
+}
+
+account_action() (
+    # Direct commands retain the original account default when no name is given.
+    account_function=$1 account_name=${2:-}
+    if [ -n "$account_name" ]; then
+        select_account "$account_name" || exit 1
+    else
+        account_context default || exit 1
+    fi
+    "$account_function" "${3:-}"
+)
+
+menu_account_action() (
+    select_account || { select_result=$?; [ "$select_result" -eq 2 ]; exit $?; }
+    "$1"
+)
+
 # Exit 2 means the inspection itself failed, not that the port is free.
 port_busy() {
     listeners=$(ss -H -lnt) || { error '无法检查监听端口。'; return 2; }
@@ -178,6 +292,13 @@ randport() {
     while [ "$port_attempt" -lt 50 ]; do
         random_number=$(od -An -N4 -tu4 /dev/urandom | tr -d ' \n') || return 1
         candidate=$((20000 + random_number % 40001))
+        if port_reserved "$candidate"; then
+            port_attempt=$((port_attempt + 1))
+            continue
+        else
+            reserved_result=$?
+            [ "$reserved_result" -eq 1 ] || return 1
+        fi
         if port_busy "$candidate"; then
             port_attempt=$((port_attempt + 1))
         else
@@ -217,9 +338,9 @@ command_args="-i 0.0.0.0 -p ${SOCKS_PORT} -u ${SOCKS_USER} -P ${SOCKS_PASS}"
 command_user="fast-s5:fast-s5"
 command_background="yes"
 pidfile="/run/${RC_SVCNAME}.pid"
-required_files="/etc/conf.d/fast-s5"
-output_log="/var/log/fast-s5.log"
-error_log="/var/log/fast-s5.log"
+required_files="/etc/conf.d/${RC_SVCNAME}"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="$output_log"
 
 depend() {
     need net
@@ -291,7 +412,7 @@ show_credentials() {
     printf '\n在另一台机器上测试：\n'
     printf 'curl -x socks5://%s:%s@%s:%s http://cip.cc\n' "$USER_NAME" "$PASS" "$test_host" "$PORT"
     if [ "$test_host" = IP ]; then
-        printf '将命令中的 IP 替换为服务器公网 IPv4 或域名；也可运行 sh fast-s5.sh credentials 服务器IP 生成完整命令。\n'
+        printf '将命令中的 IP 替换为服务器公网 IPv4 或域名；也可运行 sh fast-s5.sh credentials 服务器IP %s 生成完整命令。\n' "$USER_NAME"
     fi
     printf '请妥善保存凭据；公网使用需开放对应 TCP 端口。\n'
 }
@@ -310,23 +431,27 @@ install_proxy() {
         printf '发现保留配置，将使用原账号和端口恢复服务。\n'
     else
         PORT=$(randport) || return 1
-        USER_NAME="px$(randhex 5)"
-        PASS=$(randhex 16) || return 1
+        USER_NAME=$(random_credential) || return 1
+        PASS=$(random_credential) || return 1
         if [ "$install_mode" != random ]; then
             read_value "端口 [随机值 $PORT]: " || return 1
             PORT=${REPLY:-$PORT}
             read_value "用户名 [随机值 $USER_NAME]: " || return 1
             USER_NAME=${REPLY:-$USER_NAME}
-            read_secret '密码（回车生成随机密码，不回显）: ' || return 1
+            read_secret '密码（回车使用 10 位随机密码，不回显）: ' || return 1
             PASS=${REPLY:-$PASS}
         fi
     fi
-    validate && port_free "$PORT" || return 1
+    validate && validate_unique && port_free "$PORT" || return 1
     if [ "$install_mode" != random ]; then
         confirm '确认安装并设置开机自启？' || return 0
     fi
     build_proxy && ensure_service_user || return 1
-    save_conf && write_service || return 1
+    save_conf || return 1
+    if ! write_service; then
+        [ "$had_conf" -ne 0 ] || rm -f "$CONF"
+        return 1
+    fi
     if rc-service "$SERVICE" start && service_ready; then
         if rc-update add "$SERVICE" default; then
             printf '\n安装成功，已开启开机自启。\n'
@@ -344,6 +469,59 @@ install_proxy() {
     if [ "$had_conf" -eq 0 ]; then rm -f "$CONF"; fi
     return 1
 }
+
+install_accounts() {
+    restore_ids=$(account_ids)
+    if [ -z "$restore_ids" ]; then
+        install_proxy "${1:-interactive}"
+        return $?
+    fi
+    restore_count=0 restore_result=0
+    for restore_id in $restore_ids; do
+        restore_init=$BASE_INIT
+        [ "$restore_id" = default ] || restore_init="$BASE_INIT.user-$restore_id"
+        [ ! -e "$restore_init" ] || continue
+        restore_count=$((restore_count + 1))
+        (account_context "$restore_id" && install_proxy "${1:-interactive}") || restore_result=1
+    done
+    [ "$restore_count" -ne 0 ] || { error '服务已存在，请从菜单添加用户或管理已有账号。'; return 1; }
+    return "$restore_result"
+}
+
+add_user() (
+    [ -n "$(account_ids)" ] || { error '请先安装 fast-s5。'; exit 1; }
+    # IDs are independent of usernames so renaming does not rename services.
+    new_attempt=0
+    while [ "$new_attempt" -lt 50 ]; do
+        new_id=$(randhex 5) || exit 1
+        account_context "$new_id" || exit 1
+        if [ ! -e "$CONF" ] && [ ! -e "$INIT" ]; then
+            printf '新增用户将使用独立 TCP 端口，原账号继续运行。\n'
+            install_proxy "${1:-interactive}"
+            exit $?
+        fi
+        new_attempt=$((new_attempt + 1))
+    done
+    error '无法生成唯一的服务编号。'
+    exit 1
+)
+
+remove_account_service() {
+    if [ -f "$INIT" ]; then
+        rc-service "$SERVICE" stop || { error "停止 $SERVICE 失败，已保留账号文件。"; return 1; }
+        disable_autostart || return 1
+        rm -f "$INIT" || return 1
+    fi
+}
+
+delete_user() (
+    select_account "${1:-}" || { select_result=$?; [ "$select_result" -eq 2 ]; exit $?; }
+    load_conf || exit 1
+    confirm "确认删除用户 $USER_NAME（TCP 端口 $PORT），并删除该账号的配置和日志？" || exit 0
+    remove_account_service || exit 1
+    rm -f "$CONF" "$LOG" || exit 1
+    printf '用户 %s 已删除；其他账号继续运行。\n' "$USER_NAME"
+)
 
 status_proxy() {
     [ -f "$INIT" ] || { error '服务未安装。'; return 1; }
@@ -367,10 +545,10 @@ change_proxy() {
     read_value '新端口（回车不变，r 随机）: ' || return 1
     case "$REPLY" in r|R) PORT=$(randport) || return 1 ;; '') ;; *) PORT=$REPLY ;; esac
     read_value '新用户名（回车不变，r 随机）: ' || return 1
-    case "$REPLY" in r|R) USER_NAME="px$(randhex 5)" ;; '') ;; *) USER_NAME=$REPLY ;; esac
+    case "$REPLY" in r|R) USER_NAME=$(random_credential) || return 1 ;; '') ;; *) USER_NAME=$REPLY ;; esac
     read_secret '新密码（回车不变，r 随机，不回显）: ' || return 1
-    case "$REPLY" in r|R) PASS=$(randhex 16) || return 1 ;; '') ;; *) PASS=$REPLY ;; esac
-    validate || return 1
+    case "$REPLY" in r|R) PASS=$(random_credential) || return 1 ;; '') ;; *) PASS=$REPLY ;; esac
+    validate && validate_unique || return 1
     if [ "$PORT" != "$old_port" ]; then port_free "$PORT" || return 1; fi
     confirm '确认修改并重启？' || return 0
     save_conf || return 1
@@ -409,7 +587,7 @@ logs_proxy() {
 }
 
 uninstall_proxy() {
-    printf '1) 删除服务，保留配置和程序（可重新安装恢复）\n2) 删除服务、配置、程序和日志\n0) 返回\n'
+    printf '卸载范围：所有 fast-s5 用户。\n1) 删除所有服务，保留配置和程序（可重新安装恢复）\n2) 删除所有服务、配置、程序和日志\n0) 返回\n'
     read_value '选择: ' || return 1
     uninstall_mode=$REPLY
     case "$uninstall_mode" in
@@ -419,13 +597,17 @@ uninstall_proxy() {
            [ "$REPLY" = DELETE ] || return 0 ;;
         *) error '无效选项。'; return 1 ;;
     esac
-    if [ -f "$INIT" ]; then
-        rc-service "$SERVICE" stop || { error '停止服务失败，取消删除。'; return 1; }
-        disable_autostart || return 1
-        rm -f "$INIT" || return 1
-    fi
+    uninstall_ids=$(account_ids)
+    # Also clean up the primary service if its configuration is missing.
+    if [ ! -f "$BASE_CONF" ]; then uninstall_ids="default $uninstall_ids"; fi
+    for uninstall_id in $uninstall_ids; do
+        (
+            account_context "$uninstall_id" && remove_account_service || exit 1
+            if [ "$uninstall_mode" = 2 ]; then rm -f "$CONF" "$LOG" || exit 1; fi
+        ) || { error '卸载未完成，已保留程序；请排查后重试。'; return 1; }
+    done
     if [ "$uninstall_mode" = 2 ]; then
-        rm -f "$CONF" "$BIN" "$LOG" || return 1
+        rm -f "$BIN" || return 1
         printf '已删除服务、配置、程序和日志。\n'
     else
         printf '服务已移除；重新安装将恢复原配置。\n'
@@ -440,14 +622,20 @@ fast-s5 — Alpine Linux / OpenRC SOCKS5 管理器
   menu               交互菜单（默认）
   install            交互安装；有保留配置时恢复服务
   install --random   无需输入，使用随机端口和账号安装；保留配置优先
-  status             查看服务、监听端口和开机自启状态
-  credentials [IP]   显示账号密码及另一台机器的 curl 测试命令
-  configure          修改端口或账号；启动失败自动回滚
-  restart            重启并检查服务
-  test               通过本机 SOCKS5 查询出口 IP
-  logs               显示最近 50 行日志
-  uninstall          卸载（交互确认）
+  users              列出用户名、端口和服务名
+  add-user           添加用户，回车使用 10 位随机账号密码及随机端口
+  add-user --random  无需输入，快速添加随机用户
+  delete-user [用户] 删除指定用户；省略时交互选择，删除前确认
+  status [用户]      查看服务、监听端口和开机自启状态
+  credentials [IP] [用户] 显示账号密码及另一台机器的 curl 测试命令
+  configure [用户]   修改端口或账号；启动失败自动回滚
+  restart [用户]     重启并检查服务
+  test [用户]        通过本机 SOCKS5 查询出口 IP
+  logs [用户]        显示最近 50 行日志
+  uninstall          卸载所有用户（交互确认）
   help, --help, -h   显示帮助
+
+每个用户使用独立端口；账号命令省略用户名时操作初始账号。
 EOF
 }
 
@@ -465,14 +653,27 @@ check_environment() {
     printf '%s\n' "$$" > "$LOCK/pid"
 }
 
+show_banner() {
+    cat <<'EOF'
+
+  _____         _        ____  ____
+ |  ___|_ _ ___| |_      / ___|| ___|
+ | |_ / _` / __| __|____ \___ \|___ \
+ |  _| (_| \__ \ ||_____| ___) |___) |
+ |_|  \__,_|___/\__|    |____/|____/
+
+EOF
+}
+
 menu() {
     while :; do
-        printf '\n===== fast-s5 · Alpine SOCKS5 管理器 =====\n1) 安装\n2) 查看状态\n3) 查看账号密码和远程测试命令\n4) 修改配置\n5) 重启服务\n6) 测试本机代理出口\n7) 查看日志\n8) 卸载\n0) 退出\n'
+        printf '\n===== fast-s5 · Alpine SOCKS5 管理器 =====\n1) 安装 / 恢复\n2) 查看状态\n3) 查看账号密码和远程测试命令\n4) 修改配置\n5) 重启服务\n6) 测试本机代理出口\n7) 查看日志\n8) 卸载所有用户\n9) 快速添加随机用户\n10) 删除用户\n11) 用户列表\n0) 退出\n'
         read_value '请选择: ' || return 0
         case "$REPLY" in
-            1) install_proxy ;; 2) status_proxy ;; 3) show_credentials ;;
-            4) change_proxy ;; 5) restart_proxy ;; 6) test_proxy ;;
-            7) logs_proxy ;; 8) uninstall_proxy ;; 0) return 0 ;;
+            1) install_accounts ;; 2) menu_account_action status_proxy ;; 3) menu_account_action show_credentials ;;
+            4) menu_account_action change_proxy ;; 5) menu_account_action restart_proxy ;; 6) menu_account_action test_proxy ;;
+            7) menu_account_action logs_proxy ;; 8) uninstall_proxy ;;
+            9) add_user random ;; 10) delete_user ;; 11) list_users ;; 0) return 0 ;;
             *) error '无效选项。' ;;
         esac || printf '操作未完成，请根据上述提示处理后重试。\n' >&2
     done
@@ -481,13 +682,15 @@ menu() {
 main() {
     case "${1:-menu}" in
         help|--help|-h) usage; return 0 ;;
-        install)
+        install|add-user)
             if [ "$#" -gt 2 ] || { [ "$#" -eq 2 ] && [ "$2" != --random ]; }; then
                 usage >&2; return 1
             fi ;;
         credentials)
+            [ "$#" -le 3 ] || { usage >&2; return 1; } ;;
+        status|configure|restart|test|logs|delete-user)
             [ "$#" -le 2 ] || { usage >&2; return 1; } ;;
-        menu|status|configure|restart|test|logs|uninstall)
+        menu|users|uninstall)
             [ "$#" -le 1 ] || { usage >&2; return 1; } ;;
         *) usage >&2; return 1 ;;
     esac
@@ -496,12 +699,19 @@ main() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
     check_environment || return 1
+    init_account_paths
+    show_banner
     case "${1:-menu}" in
         menu) menu ;;
-        install) if [ "${2:-}" = --random ]; then install_proxy random; else install_proxy; fi ;;
-        status) status_proxy ;; credentials) show_credentials "${2:-}" ;;
-        configure) change_proxy ;; restart) restart_proxy ;; test) test_proxy ;;
-        logs) logs_proxy ;; uninstall) uninstall_proxy ;;
+        install) if [ "${2:-}" = --random ]; then install_accounts random; else install_accounts; fi ;;
+        add-user) if [ "${2:-}" = --random ]; then add_user random; else add_user; fi ;;
+        users) list_users ;; delete-user) delete_user "${2:-}" ;;
+        status) account_action status_proxy "${2:-}" ;;
+        credentials) account_action show_credentials "${3:-}" "${2:-}" ;;
+        configure) account_action change_proxy "${2:-}" ;;
+        restart) account_action restart_proxy "${2:-}" ;;
+        test) account_action test_proxy "${2:-}" ;;
+        logs) account_action logs_proxy "${2:-}" ;; uninstall) uninstall_proxy ;;
     esac
 }
 

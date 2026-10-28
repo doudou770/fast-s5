@@ -70,6 +70,8 @@ test_validation() {
     assert_fail valid_user 'user name'
     assert_fail valid_user ''
     assert_ok valid_pass 'Abcdef0123456789_-'
+    assert_ok valid_pass 'Abcd123456'
+    assert_fail valid_pass 'Abcd12345'
     assert_fail valid_pass short
     assert_fail valid_pass '0123456789abcdef;id'
     long_value=$(printf '%0130d' 0)
@@ -173,6 +175,8 @@ test_install_and_restore() {
     assert_ok install_proxy random < /dev/null
     assert_ok test -f "$INIT"
     assert_ok load_conf
+    assert_equal "${#USER_NAME}" 10
+    assert_equal "${#PASS}" 10
     cp "$CONF" "$CASE_DIR/original"
     assert_ok sh -n "$INIT"
     assert_fail install_proxy random < /dev/null
@@ -289,16 +293,221 @@ test_remote_test_command() {
     assert_fail show_credentials 'example.com;id'
 }
 
+test_random_credentials() {
+    for random_index in 1 2 3 4 5; do
+        random_value=$(random_credential) || fail 'random credential generation'
+        assert_equal "${#random_value}" 10
+        case "$random_value" in *[!a-zA-Z0-9]*) fail 'unexpected credential character' ;; esac
+        assert_ok valid_user "$random_value"
+        assert_ok valid_pass "$random_value"
+    done
+    mock_services
+    fixture
+    : > "$INIT"
+    service_ready() { :; }
+    printf '\nr\nr\ny\n' > "$CASE_DIR/input"
+    assert_ok change_proxy < "$CASE_DIR/input"
+    assert_ok load_conf
+    assert_equal "${#USER_NAME}" 10
+    assert_equal "${#PASS}" 10
+}
+
+mock_extra_account() {
+    mock_install
+    fixture
+    : > "$INIT"
+    FAKE_AUTOSTART='fast-s5 | default
+fast-s5.user-0123456789 | default'
+    randport() { printf '34567\n'; }
+    randhex() { printf '0123456789\n'; }
+}
+
+test_add_and_select_user() {
+    mock_extra_account
+    cp "$CONF" "$CASE_DIR/original"
+    assert_ok add_user random < /dev/null
+    assert_ok cmp "$CONF" "$CASE_DIR/original"
+    assert_ok test -f "$BASE_INIT.user-0123456789"
+    assert_ok sh -n "$BASE_INIT.user-0123456789"
+    # Match literal variables in the generated service, without expanding them here.
+    # shellcheck disable=SC2016
+    assert_ok grep -F 'required_files="/etc/conf.d/${RC_SVCNAME}"' "$BASE_INIT.user-0123456789"
+    # shellcheck disable=SC2016
+    assert_ok grep -F 'output_log="/var/log/${RC_SVCNAME}.log"' "$BASE_INIT.user-0123456789"
+    new_record=$(account_record 0123456789) || fail 'new account record'
+    new_name=${new_record% *}
+    assert_equal "${#new_name}" 10
+    assert_equal "${new_record##* }" 34567
+    assert_ok account_action show_credentials "$new_name" 203.0.113.10 > "$CASE_DIR/credentials"
+    assert_ok grep -F "@203.0.113.10:34567 http://cip.cc" "$CASE_DIR/credentials"
+    assert_ok list_users > "$CASE_DIR/users"
+    assert_ok grep -F "$new_name" "$CASE_DIR/users"
+    assert_ok grep -F test_user "$CASE_DIR/users"
+    assert_fail account_action show_credentials missing_user
+    # Configuration parsing must ignore temporary files and invalid instance IDs.
+    : > "$BASE_CONF.user-0123456789.tmp.abcd"
+    : > "$BASE_CONF.user-malformed"
+    assert_equal "$(account_ids | wc -l | tr -d ' ')" 2
+}
+
+test_duplicate_accounts_rejected() {
+    mock_extra_account
+    printf '34567\ntest_user\nAbcd123456\ny\n' > "$CASE_DIR/input"
+    assert_fail add_user < "$CASE_DIR/input"
+    assert_fail test -e "$BASE_CONF.user-0123456789"
+    printf '23456\nnew_user\nAbcd123456\ny\n' > "$CASE_DIR/input"
+    assert_fail add_user < "$CASE_DIR/input"
+    assert_fail test -e "$BASE_CONF.user-0123456789"
+    FAKE_LISTENERS='LISTEN 0 128 0.0.0.0:34567 0.0.0.0:*'
+    assert_fail add_user random < /dev/null
+    assert_fail test -e "$BASE_CONF.user-0123456789"
+}
+
+test_add_failure_preserves_other_user() {
+    mock_extra_account
+    cp "$CONF" "$CASE_DIR/original"
+    FAKE_START_RESULT=1
+    assert_fail add_user random < /dev/null
+    assert_ok cmp "$CONF" "$CASE_DIR/original"
+    assert_ok test -f "$INIT"
+    assert_fail test -e "$BASE_CONF.user-0123456789"
+    assert_fail test -e "$BASE_INIT.user-0123456789"
+    assert_fail grep -F 'fast-s5 stop' "$CASE_DIR/service.calls"
+}
+
+test_delete_user() {
+    mock_extra_account
+    assert_ok add_user random < /dev/null
+    new_record=$(account_record 0123456789) || fail 'new account record'
+    new_name=${new_record% *}
+    cp "$CONF" "$CASE_DIR/original"
+    printf 'n\n' > "$CASE_DIR/input"
+    assert_ok delete_user "$new_name" < "$CASE_DIR/input"
+    assert_ok test -f "$BASE_CONF.user-0123456789"
+    FAKE_STOP_RESULT=1
+    printf 'y\n' > "$CASE_DIR/input"
+    assert_fail delete_user "$new_name" < "$CASE_DIR/input"
+    assert_ok test -f "$BASE_CONF.user-0123456789"
+    assert_ok test -f "$BASE_INIT.user-0123456789"
+    FAKE_STOP_RESULT=0
+    FAKE_UPDATE_RESULT=1
+    assert_fail delete_user "$new_name" < "$CASE_DIR/input"
+    assert_ok test -f "$BASE_CONF.user-0123456789"
+    assert_ok test -f "$BASE_INIT.user-0123456789"
+    FAKE_UPDATE_RESULT=0
+    assert_ok delete_user "$new_name" < "$CASE_DIR/input"
+    assert_fail test -e "$BASE_CONF.user-0123456789"
+    assert_fail test -e "$BASE_INIT.user-0123456789"
+    assert_ok cmp "$CONF" "$CASE_DIR/original"
+    assert_ok test -f "$INIT"
+    assert_ok grep -Fx 'del fast-s5.user-0123456789 default' "$CASE_DIR/update.calls"
+    assert_fail grep -F 'fast-s5 stop' "$CASE_DIR/service.calls"
+    # Deleting the last user is supported, then installation can start afresh.
+    assert_ok delete_user test_user < "$CASE_DIR/input"
+    assert_equal "$(account_ids)" ''
+    assert_fail add_user random < /dev/null
+    assert_ok install_accounts random < /dev/null
+}
+
+test_multiuser_uninstall_and_restore() {
+    mock_extra_account
+    assert_ok add_user random < /dev/null
+    cp "$CONF" "$CASE_DIR/original"
+    cp "$BASE_CONF.user-0123456789" "$CASE_DIR/extra.original"
+    printf '1\ny\n' > "$CASE_DIR/input"
+    assert_ok uninstall_proxy < "$CASE_DIR/input"
+    assert_fail test -e "$INIT"
+    assert_fail test -e "$BASE_INIT.user-0123456789"
+    assert_ok cmp "$CONF" "$CASE_DIR/original"
+    assert_ok cmp "$BASE_CONF.user-0123456789" "$CASE_DIR/extra.original"
+    assert_ok install_accounts random < /dev/null
+    assert_ok test -f "$INIT"
+    assert_ok test -f "$BASE_INIT.user-0123456789"
+    assert_ok cmp "$CONF" "$CASE_DIR/original"
+    assert_ok cmp "$BASE_CONF.user-0123456789" "$CASE_DIR/extra.original"
+    assert_equal "$(grep -Fc 'fast-s5 stop' "$CASE_DIR/service.calls")" 1
+    assert_equal "$(grep -Fc 'fast-s5.user-0123456789 stop' "$CASE_DIR/service.calls")" 1
+    printf '2\nDELETE\n' > "$CASE_DIR/input"
+    assert_ok uninstall_proxy < "$CASE_DIR/input"
+    assert_equal "$(account_ids)" ''
+    assert_fail test -e "$BASE_INIT.user-0123456789"
+}
+
+test_extra_account_without_primary() {
+    mock_extra_account
+    assert_ok add_user random < /dev/null
+    new_record=$(account_record 0123456789) || fail 'new account record'
+    new_name=${new_record% *}
+    printf 'y\n' > "$CASE_DIR/input"
+    assert_ok delete_user test_user < "$CASE_DIR/input"
+    assert_equal "$(account_ids)" 0123456789
+    assert_ok account_action show_credentials "$new_name"
+    printf '1\ny\n' > "$CASE_DIR/input"
+    assert_ok uninstall_proxy < "$CASE_DIR/input"
+    assert_ok install_accounts random < /dev/null
+    assert_fail test -e "$BASE_CONF"
+    assert_ok test -f "$BASE_INIT.user-0123456789"
+}
+
+test_reserved_port() {
+    mock_services
+    fixture
+    assert_ok port_reserved 23456
+    assert_fail port_reserved 34567
+    # Even a stopped account keeps its allocated port.
+    od() { printf '3456\n'; }
+    assert_fail randport
+}
+
+test_multiuser_configuration() {
+    mock_extra_account
+    assert_ok add_user random < /dev/null
+    new_record=$(account_record 0123456789) || fail 'new account record'
+    new_name=${new_record% *}
+    cp "$CONF" "$CASE_DIR/original"
+    cp "$BASE_CONF.user-0123456789" "$CASE_DIR/extra.original"
+    printf '\ntest_user\n\ny\n' > "$CASE_DIR/input"
+    assert_fail account_action change_proxy "$new_name" < "$CASE_DIR/input"
+    assert_ok cmp "$BASE_CONF.user-0123456789" "$CASE_DIR/extra.original"
+    printf '23456\n\n\ny\n' > "$CASE_DIR/input"
+    assert_fail account_action change_proxy "$new_name" < "$CASE_DIR/input"
+    assert_ok cmp "$BASE_CONF.user-0123456789" "$CASE_DIR/extra.original"
+    printf '45678\nrenamed_user\nr\ny\n' > "$CASE_DIR/input"
+    assert_ok account_action change_proxy "$new_name" < "$CASE_DIR/input"
+    assert_equal "$(account_record 0123456789)" 'renamed_user 45678'
+    assert_ok account_action show_credentials renamed_user 203.0.113.10 > "$CASE_DIR/credentials"
+    assert_ok grep -F '@203.0.113.10:45678 http://cip.cc' "$CASE_DIR/credentials"
+    assert_ok grep -Fx 'fast-s5.user-0123456789 restart' "$CASE_DIR/service.calls"
+    assert_fail grep -Fx 'fast-s5 restart' "$CASE_DIR/service.calls"
+    assert_ok cmp "$CONF" "$CASE_DIR/original"
+}
+
+test_menu_user_actions_and_banner() {
+    check_environment() { :; }
+    add_user() { printf 'add %s\n' "$1" >> "$CASE_DIR/menu.calls"; }
+    delete_user() { printf 'delete\n' >> "$CASE_DIR/menu.calls"; }
+    list_users() { printf 'list\n' >> "$CASE_DIR/menu.calls"; }
+    printf '9\n10\n11\n0\n' > "$CASE_DIR/input"
+    assert_ok main menu < "$CASE_DIR/input" > "$CASE_DIR/menu.output"
+    assert_equal "$(cat "$CASE_DIR/menu.calls")" "$(printf 'add random\ndelete\nlist')"
+    assert_equal "$(grep -Fc '_____         _' "$CASE_DIR/menu.output")" 1
+    assert_equal "$(grep -Fc '===== fast-s5 · Alpine SOCKS5 管理器 =====' "$CASE_DIR/menu.output")" 4
+}
+
 passed=0
 for test_name in validation configuration port_inspection random_free_port \
     blank_password_kept failed_change_rolls_back missing_listener_rolls_back \
     input_end_preserves_configuration install_and_restore build_failure_does_not_install \
     install_failure_cleanup uninstall_stop_failure_preserves_files uninstall_without_autostart \
-    autostart_failure_does_not_report_success proxy_error_propagates terminal_editing remote_test_command; do
+    autostart_failure_does_not_report_success proxy_error_propagates terminal_editing remote_test_command \
+    random_credentials add_and_select_user duplicate_accounts_rejected add_failure_preserves_other_user \
+    delete_user multiuser_uninstall_and_restore extra_account_without_primary reserved_port \
+    multiuser_configuration menu_user_actions_and_banner; do
     CASE_DIR="$SANDBOX/$test_name"
     mkdir "$CASE_DIR" || exit 1
     CONF="$CASE_DIR/fast-s5.conf" INIT="$CASE_DIR/fast-s5.init" BIN="$CASE_DIR/microsocks"
     LOG="$CASE_DIR/fast-s5.log" LOCK="$CASE_DIR/lock"
+    init_account_paths
     if ("test_$test_name") > "$CASE_DIR/output" 2>&1; then
         printf 'PASS: %s\n' "$test_name"
         passed=$((passed + 1))
