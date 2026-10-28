@@ -15,6 +15,7 @@ LEGACY_BIN=/usr/local/bin/microsocks
 CONF=/etc/conf.d/fast-s5
 INIT=/etc/init.d/fast-s5
 LOG=/var/log/fast-s5.log
+BUILD_LOG=/var/log/fast-s5-build.log
 LOCK=/run/fast-s5.lock
 SERVICE_USER=fast-s5
 PROXY_VERSION=0.9.5
@@ -348,20 +349,43 @@ EOF
     chmod 755 "$service_tmp" && mv -f "$service_tmp" "$BASE_INIT"
 )
 
+build_proxy_source() {
+    source_dir=$1
+    apk add --no-cache git build-base linux-headers ca-certificates || return 1
+    git clone --depth 1 --branch "$PROXY_VERSION" https://github.com/3proxy/3proxy.git "$source_dir" || return 1
+    [ "$(git -C "$source_dir" rev-parse HEAD)" = "$PROXY_COMMIT" ] || {
+        error '3proxy 源码版本校验失败。'; return 1;
+    }
+    # Prepare upstream's Linux settings, then build only the managed executable.
+    # The default target also builds unrelated standalone proxy tools.
+    cp "$source_dir/Makefile.Linux" "$source_dir/src/Makefile.var" || return 1
+    make -C "$source_dir/src" ../bin/3proxy PLUGINS='' || return 1
+    [ -x "$source_dir/bin/3proxy" ] || { error '编译未生成可执行程序。'; return 1; }
+    mkdir -p "$(dirname "$BIN")" || return 1
+    install -m 755 "$source_dir/bin/3proxy" "$BIN"
+}
+
 build_proxy() (
     [ -x "$BIN" ] && exit 0
-    apk add --no-cache git build-base linux-headers ca-certificates || exit 1
+    mkdir -p "$(dirname "$BUILD_LOG")" || exit 1
+    if ! { : > "$BUILD_LOG" && chmod 600 "$BUILD_LOG"; }; then
+        error '无法写入构建日志。'; exit 1
+    fi
     work=$(mktemp -d) || exit 1
     trap 'rm -rf "$work"' 0
     trap 'exit 1' HUP INT TERM
-    git clone --depth 1 --branch "$PROXY_VERSION" https://github.com/3proxy/3proxy.git "$work/src" || exit 1
-    [ "$(git -C "$work/src" rev-parse HEAD)" = "$PROXY_COMMIT" ] || {
-        error '3proxy 源码版本校验失败。'; exit 1;
-    }
-    make -C "$work/src" -f Makefile.Linux PLUGINS='' || exit 1
-    [ -x "$work/src/bin/3proxy" ] || { error '编译失败。'; exit 1; }
-    mkdir -p "$(dirname "$BIN")" || exit 1
-    install -m 755 "$work/src/bin/3proxy" "$BIN"
+    printf '正在准备依赖并编译代理，请稍候；详细日志：%s\n' "$BUILD_LOG"
+    if build_proxy_source "$work/src" >> "$BUILD_LOG" 2>&1; then
+        printf '代理程序构建完成。\n'
+        if grep -F 'warning:' "$BUILD_LOG" >/dev/null; then
+            printf '上游编译警告已记录，构建成功。详情：%s\n' "$BUILD_LOG"
+        fi
+    else
+        error "代理程序构建失败，完整日志：$BUILD_LOG"
+        printf '最近的构建输出：\n' >&2
+        tail -n 40 "$BUILD_LOG" >&2
+        exit 1
+    fi
 )
 
 account_credentials() (

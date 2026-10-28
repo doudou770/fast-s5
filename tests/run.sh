@@ -450,6 +450,63 @@ test_unknown_service() {
     assert_fail install_accounts random
     assert_ok cmp "$INIT" "$CASE_DIR/original"
 }
+mock_build_commands() {
+    FAKE_BUILD_RESULT=0 FAKE_BUILD_ARTIFACT=1 FAKE_BUILD_COMMIT=$PROXY_COMMIT
+    apk() { printf 'mock dependencies\n'; }
+    git() {
+        if [ "$1" = clone ]; then
+            for mock_arg do source_path=$mock_arg; done
+            mkdir -p "$source_path/src" "$source_path/bin" || return 1
+            printf '# Linux build settings\n' > "$source_path/Makefile.Linux"
+        else
+            printf '%s\n' "$FAKE_BUILD_COMMIT"
+        fi
+    }
+    make() {
+        printf '%s\n' "$*" > "$CASE_DIR/make.args"
+        printf 'upstream.c: warning: sample warning\n' >&2
+        if [ "$FAKE_BUILD_RESULT" -ne 0 ]; then
+            printf 'upstream.c: error: sample build failure\n' >&2
+            return "$FAKE_BUILD_RESULT"
+        fi
+        if [ "$FAKE_BUILD_ARTIFACT" -eq 1 ]; then
+            printf '#!/bin/sh\nexit 0\n' > "$2/../bin/3proxy"
+            chmod +x "$2/../bin/3proxy" || return 1
+        fi
+    }
+}
+test_build_warning_and_reuse() {
+    mock_build_commands
+    assert_ok build_proxy > "$CASE_DIR/build.output" 2>&1
+    assert_ok test -x "$BIN"
+    assert_ok grep -F 'warning: sample warning' "$BUILD_LOG"
+    assert_fail grep -F 'warning: sample warning' "$CASE_DIR/build.output"
+    assert_ok grep -F '代理程序构建完成' "$CASE_DIR/build.output"
+    assert_ok grep -F '../bin/3proxy PLUGINS=' "$CASE_DIR/make.args"
+    cp "$BUILD_LOG" "$CASE_DIR/build.original"
+    apk() { fail 'reused binary must not build'; }
+    assert_ok build_proxy
+    assert_ok cmp "$BUILD_LOG" "$CASE_DIR/build.original"
+}
+test_build_failure_reporting() {
+    mock_build_commands
+    FAKE_BUILD_RESULT=2
+    assert_fail build_proxy > "$CASE_DIR/build.output" 2>&1
+    assert_fail test -e "$BIN"
+    assert_ok grep -F 'error: sample build failure' "$BUILD_LOG"
+    assert_ok grep -F 'error: sample build failure' "$CASE_DIR/build.output"
+    assert_ok grep -F "$BUILD_LOG" "$CASE_DIR/build.output"
+    assert_fail grep -F '代理程序构建完成' "$CASE_DIR/build.output"
+    FAKE_BUILD_RESULT=0 FAKE_BUILD_ARTIFACT=0
+    assert_fail build_proxy > "$CASE_DIR/build.output" 2>&1
+    assert_fail test -e "$BIN"
+    assert_ok grep -F '编译未生成可执行程序' "$CASE_DIR/build.output"
+    FAKE_BUILD_COMMIT=wrong_commit
+    rm -f "$CASE_DIR/make.args"
+    assert_fail build_proxy > "$CASE_DIR/build.output" 2>&1
+    assert_ok grep -F '源码版本校验失败' "$CASE_DIR/build.output"
+    assert_fail test -e "$CASE_DIR/make.args"
+}
 test_menu_and_cli() {
     check_environment() { :; }
     add_user() { printf 'add %s %s\n' "$1" "${2:-}" >> "$CASE_DIR/menu.calls"; }
@@ -470,12 +527,13 @@ for test_name in validation configuration port_inspection random_free_port \
     random_credentials shared_runtime duplicate_user owned_port quick_add_port quick_add_shared \
     quick_add_random_port add_failures change_and_rollback delete_shared_user delete_failure \
     install_and_restore install_failures autostart_failure uninstall migration migration_rollback \
-    unknown_service menu_and_cli; do
+    unknown_service build_warning_and_reuse build_failure_reporting menu_and_cli; do
     CASE_DIR="$SANDBOX/$test_name"
     mkdir "$CASE_DIR" || exit 1
     CONF="$CASE_DIR/fast-s5.conf" INIT="$CASE_DIR/fast-s5.init" BIN="$CASE_DIR/fast-s5-proxy"
     RUNTIME="$CASE_DIR/runtime/3proxy.cfg" PIDFILE="$CASE_DIR/fast-s5.pid"
     LEGACY_BIN="$CASE_DIR/microsocks" LOG="$CASE_DIR/fast-s5.log" LOCK="$CASE_DIR/lock"
+    BUILD_LOG="$CASE_DIR/build.log"
     init_account_paths
     if ("test_$test_name") > "$CASE_DIR/output" 2>&1; then
         printf 'PASS: %s\n' "$test_name"
