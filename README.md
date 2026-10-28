@@ -27,10 +27,27 @@
 
 ## 快速开始
 
-先以 root 登录 Alpine。下载到本地检查后执行，不要将脚本通过管道直接交给 `sh`，因为交互操作需要标准输入。
+先以 root 登录已启用 OpenRC 的 Alpine Linux。
+
+### 一行启动
+
+复制下面这一行，即可下载脚本并打开管理菜单：
+
+```sh
+curl -fsSL "https://raw.githubusercontent.com/doudou770/fast-s5/main/fast-s5.sh" -o /root/fast-s5.sh && sh /root/fast-s5.sh
+```
+
+进入菜单后选择 `1) 安装 / 恢复` 即可开始。脚本保存在 `/root/fast-s5.sh`，以后运行 `sh /root/fast-s5.sh` 可再次打开菜单。脚本使用 Alpine 自带的 `sh`，无需安装 Bash。
+
+若系统提示找不到 `curl`，先安装下载工具后重试：
 
 ```sh
 apk add --no-cache curl ca-certificates
+```
+
+也可以分步下载、检查脚本后再运行：
+
+```sh
 curl -fL --retry 3 \
   https://raw.githubusercontent.com/doudou770/fast-s5/main/fast-s5.sh \
   -o /root/fast-s5.sh
@@ -38,6 +55,14 @@ chmod 700 /root/fast-s5.sh
 ```
 
 ### 快速随机安装
+
+一行完成下载并直接安装，账号和密码默认各随机 10 位：
+
+```sh
+curl -fsSL "https://raw.githubusercontent.com/doudou770/fast-s5/main/fast-s5.sh" -o /root/fast-s5.sh && sh /root/fast-s5.sh install --random
+```
+
+已经下载脚本时，直接运行：
 
 ```sh
 sh /root/fast-s5.sh install --random
@@ -51,7 +76,7 @@ sh /root/fast-s5.sh install --random
 sh /root/fast-s5.sh
 ```
 
-选择 `1) 安装`，按提示输入端口、用户名和密码，全部回车使用随机值，最后确认安装。也可以直接执行：
+选择 `1) 安装 / 恢复`，按提示输入端口、用户名和密码，全部回车使用随机值，最后确认安装。也可以直接执行：
 
 ```sh
 sh /root/fast-s5.sh install
