@@ -1,0 +1,10 @@
+# Local credentials, backups and editor files
+.env
+.env.*
+*.log
+*.bak
+*.tmp
+*.swp
+.DS_Store
+.idea/
+.vscode/

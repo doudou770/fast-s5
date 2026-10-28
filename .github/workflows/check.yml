@@ -1,0 +1,24 @@
+name: fast-s5 checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check fast-s5 on Alpine ash
+        run: |
+          docker run --rm -v "$PWD:/project:ro" -w /project alpine:3.22 sh -ec '
+            apk add --no-cache shellcheck
+            sh -n fast-s5.sh
+            sh -n tests/run.sh
+            shellcheck -s sh fast-s5.sh tests/*.sh
+            sh tests/run.sh
+          '
