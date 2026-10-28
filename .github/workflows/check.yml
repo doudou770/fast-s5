@@ -21,4 +21,10 @@ jobs:
             sh -n tests/run.sh
             shellcheck -s sh fast-s5.sh tests/*.sh
             sh tests/run.sh
+            apk add --no-cache python3
+            sed '\''/^main "\$@"$/d'\'' fast-s5.sh > /tmp/fast-s5-library.sh
+            . /tmp/fast-s5-library.sh
+            BIN=/tmp/fast-s5-proxy
+            build_proxy
+            python3 tests/proxy_integration.py "$BIN"
           '
